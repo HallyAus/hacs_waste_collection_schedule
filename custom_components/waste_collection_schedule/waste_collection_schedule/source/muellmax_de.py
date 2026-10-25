@@ -1,3 +1,5 @@
+import logging
+import re
 from html.parser import HTMLParser
 
 import requests
@@ -6,9 +8,12 @@ from waste_collection_schedule.exceptions import SourceArgumentNotFoundWithSugge
 from waste_collection_schedule.service.ICS import ICS
 from waste_collection_schedule.service.MuellmaxDe import SERVICE_MAP
 
+_LOGGER = logging.getLogger(__name__)
+
 TITLE = "Müllmax"
 DESCRIPTION = "Source for Müllmax waste collection."
 URL = "https://www.muellmax.de"
+COUNTRY = "de"
 
 
 def EXTRA_INFO():
@@ -43,7 +48,13 @@ TEST_CASES = {
 }
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/58.0.3029.110 Safari/537.3"
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/126.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "de-DE,de;q=0.9,en;q=0.8",
 }
 
 PARAM_TRANSLATIONS = {
@@ -56,7 +67,6 @@ PARAM_TRANSLATIONS = {
 }
 
 
-# Parser for HTML checkbox
 class InputCheckboxParser(HTMLParser):
     def __init__(self, startswith):
         super().__init__()
@@ -74,7 +84,6 @@ class InputCheckboxParser(HTMLParser):
                 self._value[d["name"]] = d.get("value")
 
 
-# Parser for HTML select options
 class SelectOptionParser(HTMLParser):
     def __init__(self, select_name):
         super().__init__()
@@ -100,7 +109,6 @@ class SelectOptionParser(HTMLParser):
             self._in_select = False
 
 
-# Parser for HTML input (hidden) text
 class InputTextParser(HTMLParser):
     def __init__(self, **identifiers):
         super().__init__()
@@ -120,6 +128,75 @@ class InputTextParser(HTMLParser):
             self._value = d.get("value")
 
 
+class SubmitButtonParser(HTMLParser):
+    """Extract all submit/image input names and values."""
+
+    def __init__(self):
+        super().__init__()
+        self.buttons = {}
+
+    def handle_starttag(self, tag, attrs):
+        if tag == "input":
+            d = dict(attrs)
+            input_type = d.get("type", "").lower()
+            name = d.get("name", "")
+            if input_type in ("submit", "image") and name:
+                self.buttons[name] = d.get("value", "")
+
+
+def _extract_session(html: str) -> str | None:
+    """Extract mm_ses value from HTML response."""
+    p = InputTextParser(name="mm_ses")
+    p.feed(html)
+    return p.value
+
+
+def _accept_privacy(session: requests.Session, url: str, html: str) -> str:
+    """Detect and accept a Müllmax privacy/cookie consent page.
+
+    Returns the HTML of the actual start page (either the original html
+    if no consent page was detected, or the response after accepting).
+    """
+    if "mm_ses" in html:
+        return html
+
+    bp = SubmitButtonParser()
+    bp.feed(html)
+
+    consent_button = None
+    for name, value in bp.buttons.items():
+        if re.search(r"mm_dse|mm_.*ok|mm_.*accept|mm_.*weiter", name, re.I):
+            consent_button = (name, value)
+            break
+
+    if consent_button is None:
+        for name, value in bp.buttons.items():
+            if name.startswith("mm_"):
+                consent_button = (name, value)
+                break
+
+    if consent_button is None:
+        return html
+
+    _LOGGER.debug("Detected consent page, accepting via %s", consent_button[0])
+
+    ses = _extract_session(html)
+    args = {}
+    if ses:
+        args["mm_ses"] = ses
+
+    if consent_button[0].endswith((".x", ".y")):
+        base = consent_button[0].rsplit(".", 1)[0]
+        args[f"{base}.x"] = 0
+        args[f"{base}.y"] = 0
+    else:
+        args[consent_button[0]] = consent_button[1]
+
+    r = session.post(url, data=args, headers={**HEADERS, "Referer": url})
+    r.raise_for_status()
+    return r.text
+
+
 class Source:
     def __init__(
         self,
@@ -134,54 +211,66 @@ class Source:
         self._mm_frm_hnr_sel = mm_frm_hnr_sel
         self._ics = ICS()
 
-    def fetch(self):
-        mm_ses = InputTextParser(name="mm_ses")
+    def _post(self, session, url, args):
+        r = session.post(url, data=args, headers={**HEADERS, "Referer": url})
+        r.raise_for_status()
+        return r
 
+    def fetch(self):
         url = (
             f"https://www.muellmax.de/abfallkalender/"
             f"{self._service.lower()}/res/"
             f"{self._service}Start.php"
         )
         session = requests.Session()
-        r = session.get(url, headers=HEADERS)
-        mm_ses.feed(r.text)
 
-        # select "Abfuhrtermine", returns ort or an empty street search field
-        args = {"mm_ses": mm_ses.value, "mm_aus_ort.x": 0, "mm_aus_ort.y": 0}
-        r = session.post(url, data=args, headers=HEADERS)
-        mm_ses.feed(r.text)
+        r = session.get(url, headers=HEADERS)
+        r.raise_for_status()
+
+        html = _accept_privacy(session, url, r.text)
+
+        mm_ses_val = _extract_session(html)
+        if mm_ses_val is None:
+            raise ValueError(
+                "Could not find session token on the start page. "
+                "The Müllmax website may have changed its layout."
+            )
+
+        # select "Abfuhrtermine"
+        args = {"mm_ses": mm_ses_val, "mm_aus_ort.x": 0, "mm_aus_ort.y": 0}
+        r = self._post(session, url, args)
+        mm_ses_val = _extract_session(r.text) or mm_ses_val
 
         if self._mm_frm_ort_sel is not None:
-            # select city
             args = {
-                "mm_ses": mm_ses.value,
+                "mm_ses": mm_ses_val,
                 "xxx": 1,
                 "mm_frm_ort_sel": self._mm_frm_ort_sel,
                 "mm_aus_ort_submit": "weiter",
             }
-            r = session.post(url, data=args, headers=HEADERS)
-            mm_ses.feed(r.text)
+            r = self._post(session, url, args)
+            mm_ses_val = _extract_session(r.text) or mm_ses_val
 
         if self._mm_frm_str_sel is not None:
-            # show street selection page
+            # search for street
             args = {
-                "mm_ses": mm_ses.value,
+                "mm_ses": mm_ses_val,
                 "xxx": 1,
                 "mm_frm_str_name": self._mm_frm_str_sel,
                 "mm_aus_str_txt_submit": "suchen",
             }
-            r = session.post(url, data=args, headers=HEADERS)
-            mm_ses.feed(r.text)
+            r = self._post(session, url, args)
+            mm_ses_val = _extract_session(r.text) or mm_ses_val
 
             # select street
             args = {
-                "mm_ses": mm_ses.value,
+                "mm_ses": mm_ses_val,
                 "xxx": 1,
                 "mm_frm_str_sel": self._mm_frm_str_sel,
                 "mm_aus_str_sel_submit": "weiter",
             }
-            r = session.post(url, data=args, headers=HEADERS)
-            mm_ses.feed(r.text)
+            r = self._post(session, url, args)
+            mm_ses_val = _extract_session(r.text) or mm_ses_val
 
         # auto-detect if house number selection is required
         if "mm_frm_hnr_sel" in r.text:
@@ -193,7 +282,6 @@ class Source:
                     "mm_frm_hnr_sel", "", op.options
                 )
 
-            # if user provided a plain number, match against dropdown options
             if ";" not in str(hnr_value):
                 op = SelectOptionParser("mm_frm_hnr_sel")
                 op.feed(r.text)
@@ -210,44 +298,43 @@ class Source:
                     )
 
             args = {
-                "mm_ses": mm_ses.value,
+                "mm_ses": mm_ses_val,
                 "xxx": 1,
                 "mm_frm_hnr_sel": hnr_value,
                 "mm_aus_hnr_sel_submit": "weiter",
             }
-            r = session.post(url, data=args, headers=HEADERS)
-            mm_ses.feed(r.text)
+            r = self._post(session, url, args)
+            mm_ses_val = _extract_session(r.text) or mm_ses_val
 
-        # select to get ical
+        # select iCal output
         args = {
-            "mm_ses": mm_ses.value,
+            "mm_ses": mm_ses_val,
             "xxx": 1,
             "mm_ica_auswahl": "iCalendar-Datei",
         }
-        r = session.post(url, data=args, headers=HEADERS)
-        mm_ses.feed(r.text)
+        r = self._post(session, url, args)
+        mm_ses_val = _extract_session(r.text) or mm_ses_val
 
         mm_frm_fra = InputCheckboxParser(startswith="mm_frm_fra")
         mm_frm_fra.feed(r.text)
 
-        # get ics file
-        args = {"mm_ses": mm_ses.value, "xxx": 1, "mm_frm_type": "termine"}
+        # download ICS file
+        args = {"mm_ses": mm_ses_val, "xxx": 1, "mm_frm_type": "termine"}
         args.update(mm_frm_fra.value)
         args.update({"mm_ica_gen": "iCalendar-Datei laden"})
-        r = session.post(url, data=args, headers=HEADERS)
-        mm_ses.feed(r.text)
+        r = self._post(session, url, args)
 
-        entries = []
-
-        # parse ics file
-        try:
+        content_type = r.headers.get("content-type", "")
+        if "text/calendar" in content_type or r.text.strip().startswith("BEGIN:"):
             dates = self._ics.convert(r.text)
-        except ValueError as e:
-            raise ValueError(
-                "Got invalid response from the server, please recheck your arguments"
-            ) from e
+            return [Collection(d[0], d[1]) for d in dates]
 
-        entries = []
-        for d in dates:
-            entries.append(Collection(d[0], d[1]))
-        return entries
+        # response is HTML, not ICS — diagnose what went wrong
+        _LOGGER.debug(
+            "ICS download returned HTML (Content-Type: %s), length=%d",
+            content_type,
+            len(r.text),
+        )
+        raise ValueError(
+            "Got invalid response from the server, please recheck your arguments"
+        )
